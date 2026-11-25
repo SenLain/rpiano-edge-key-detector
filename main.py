@@ -36,6 +36,7 @@ conf_threshold = DEFAULT_CONF_THRESHOLD
 volume_gate = DEFAULT_VOLUME_GATE
 piano_keys = DEFAULT_PIANO_KEYS
 
+# ------------ IOT HUB ------------
 async def connect(connection_string):
     global client
 
@@ -72,11 +73,6 @@ def load_twin_config(twin):
     volume_gate = float(desired.get("volumeGate", DEFAULT_VOLUME_GATE))
     set_piano_keys(int(desired.get("pianoKeys", DEFAULT_PIANO_KEYS)))
 
-    print(
-        f"[TWIN STARTUP] confThreshold={conf_threshold}, "
-        f"volumeGate={volume_gate}, pianoKeys={piano_keys}"
-    )
-
 async def twin_patch_handler(patch):
     global conf_threshold, volume_gate, piano_keys
 
@@ -87,12 +83,28 @@ async def twin_patch_handler(patch):
     if "pianoKeys" in patch:
         set_piano_keys(int(patch["pianoKeys"]))
 
+async def send_telemetry(data):
+    if not client:
+        return
+    message = Message(json.dumps(data))
+    message.content_encoding = "utf-8"
+    message.content_type = "application/json"
+    message.message_id = str(uuid.uuid4())
+    await client.send_message(message)
+
+async def send_session_to_iothub(record_session):
+    await send_telemetry(record_session)
+
 async def main():
     client = await connect(config.IOT_CONNECTION_STRING)
     twin = await client.get_twin()
     load_twin_config(twin)
 
     client.on_twin_desired_properties_patch_received = twin_patch_handler
+
+    while True:
+        await asyncio.sleep(1)
+    
     
 
 if __name__ == "__main__":
