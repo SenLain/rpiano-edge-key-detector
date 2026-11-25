@@ -20,15 +20,3 @@ COMMAND_FILE = RUNTIME_DIR / "command.json"
 IOT_CONNECTION_STRING = os.getenv("IOT_CONNECTION_STRING")
 DEVICE_ID = os.getenv("DEVICE_ID")
 QUESTDB_URL = os.getenv("QUESTDB_URL")
-
-# Audio & DSP Constants
-TARGET_SR = 16000
-N_FFT = 8192
-SAMPLES_TARGET = int(0.5 * TARGET_SR)
-NOTE_NAMES = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"]
-
-# Default Device Twin Settings
-DEFAULT_IS_LISTENING = True
-DEFAULT_CONF_THRESHOLD = 0.45
-DEFAULT_VOLUME_GATE = 0.0075
-DEFAULT_PIANO_KEYS = 88
