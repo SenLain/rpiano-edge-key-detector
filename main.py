@@ -10,9 +10,10 @@ import numpy as np
 import requests
 import sounddevice as sd
 from ai_edge_litert.interpreter import Interpreter
-from azure.iot.device import Message, MethodResponse
+from azure.iot.device import Message
 from azure.iot.device.aio import IoTHubDeviceClient
 from scipy.signal import butter, resample_poly, sosfilt
+from questdb import Sender, TimestampNanos
 
 import config
 
@@ -29,18 +30,20 @@ DEFAULT_VOLUME_GATE = 0.0075
 DEFAULT_PIANO_KEYS = 88
 
 client = None
-# Default settings
 is_listening = DEFAULT_IS_LISTENING
 conf_threshold = DEFAULT_CONF_THRESHOLD
 volume_gate = DEFAULT_VOLUME_GATE
 piano_keys = DEFAULT_PIANO_KEYS
 
+is_recording = False
+note_counts = np.zeros(12, dtype=int)
+first_pc = None
+last_pc = None
+last_result = None
 
 # ------------ IOT HUB ------------
 
 async def connect(connection_string):
-    global client
-
     client = IoTHubDeviceClient.create_from_connection_string(connection_string)
     await client.connect()
     return client
@@ -59,20 +62,20 @@ def set_piano_keys(raw_value):
     global piano_keys
 
     try:
-        canditate = int(raw_value)
+        candidate = int(raw_value)
     except (TypeError, ValueError):
         return
 
-    piano_keys = min(config.STANDARD_PIANO_SIZES, key=lambda size: abs(size - canditate))
+    piano_keys = min(config.STANDARD_PIANO_SIZES, key=lambda size: abs(size - candidate))
 
 def load_twin_config(twin):
-    global conf_threshold, volume_gate, piano_keys    
+    global conf_threshold, volume_gate
 
     desired = get_desired_properties(twin)
 
     conf_threshold = float(desired.get("confThreshold", DEFAULT_CONF_THRESHOLD))
     volume_gate = float(desired.get("volumeGate", DEFAULT_VOLUME_GATE))
-    set_piano_keys(int(desired.get("pianoKeys", DEFAULT_PIANO_KEYS)))
+    set_piano_keys(desired.get("pianoKeys", DEFAULT_PIANO_KEYS))
 
 async def twin_patch_handler(patch):
     global conf_threshold, volume_gate
@@ -82,7 +85,7 @@ async def twin_patch_handler(patch):
     if "volumeGate" in patch:
         volume_gate = float(patch["volumeGate"])
     if "pianoKeys" in patch:
-        set_piano_keys(int(patch["pianoKeys"]))
+        set_piano_keys(patch["pianoKeys"])
 
 async def send_session_to_iothub(data):
     if not client:
@@ -95,26 +98,23 @@ async def send_session_to_iothub(data):
 
 
 # -------- QUESTDB --------
-def init_questdb():
-    sql = (
-        "CREATE TABLE IF NOT EXISTS piano_sessions ("
-        "ts TIMESTAMP, session_id SYMBOL, total_notes INT, notes_played STRING, synced BOOLEAN"
-        ") timestamp(ts);"
-    )
-    try:
-        requests.get(config.QUESTDB_URL, params={"query": sql}, timeout=0.5)
-    except Exception:
-        pass
-
-
 def save_to_questdb(payload, notes_played):
-    synced = "true" if client is not None else "false"
-    sql = (
-        f"INSERT INTO piano_sessions VALUES("
-        f"now(), '{payload['session_id']}', {payload['total_notes']}, '{notes_played}', {synced});"
-    )
     try:
-        requests.get(config.QUESTDB_URL, params={"query": sql}, timeout=0.5)
+        with Sender.from_conf(config.QUESTDB_CONF) as sender:
+            sender.row(
+                "piano_sessions",
+                symbols={
+                    "session_id": payload["session_id"],
+                    "device_id": payload["device_id"],
+                },
+                columns={
+                    "total_notes": int(payload["total_notes"]),
+                    "notes_played": notes_played,
+                    "synced": client is not None,
+                },
+                at=TimestampNanos.now(),
+            )
+            sender.flush()
     except Exception:
         pass
 
@@ -143,6 +143,7 @@ def init_audio_pipeline():
     out_idx = interpreter.get_output_details()[0]["index"]
 
     return {
+        "mic_info": f"{dev_info['name']} ({native_sr} Hz -> {TARGET_SR} Hz)",
         "native_sr": native_sr,
         "samples_native": samples_native,
         "hop_native": hop_native,
@@ -264,19 +265,101 @@ async def stop_recording():
     }
 
 
+# --- IPC FILE BRIDGE ---
+
+def write_json_atomic(path, data):
+    tmp_path = path.with_name(f"{path.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            json.dump(data, f)
+        os.replace(tmp_path, path)
+    finally:
+        tmp_path.unlink(missing_ok=True)
+
+async def handle_ui_command():
+    global is_listening
+    if not config.COMMAND_FILE.exists():
+        return
+    try:
+        with open(config.COMMAND_FILE, "r", encoding="utf-8") as f:
+            cmd = json.load(f)
+        config.COMMAND_FILE.unlink(missing_ok=True)
+
+        action = cmd.get("action")
+        if action == "start":
+            start_recording()
+        elif action == "stop":
+            await stop_recording()
+        elif action == "set_listening":
+            is_listening = bool(cmd.get("value", False))
+        elif action == "set_piano_keys":
+            set_piano_keys(cmd.get("value"))
+    except Exception:
+        pass
+
+def publish_live_state(mic_info, rms, latency_ms, detected):
+    write_json_atomic(
+        config.STATE_FILE,
+        {
+            "mic_info": mic_info,
+            "rms": round(rms, 4),
+            "latency_ms": round(latency_ms, 2),
+            "detected": detected,
+            "recording": is_recording,
+            "recorded_notes_count": int(np.sum(note_counts)),
+            "is_listening": is_listening,
+            "iot_connected": client is not None,
+            "config": {
+                "confThreshold": conf_threshold,
+                "volumeGate": volume_gate,
+                "pianoKeys": piano_keys,
+            },
+            "last_result": last_result,
+        },
+    )
+
+
 # ----------- MAIN ------------
 
 async def main():
-    client = await connect(config.IOT_CONNECTION_STRING)
-    twin = await client.get_twin()
-    load_twin_config(twin)
-
-    client.on_twin_desired_properties_patch_received = twin_patch_handler
-
-    while True:
-        await asyncio.sleep(1)
+    global client
     
-    
+    try:
+        client = await connect(config.IOT_CONNECTION_STRING)
+        if client:
+            twin = await client.get_twin()
+            load_twin_config(twin)
+            client.on_twin_desired_properties_patch_received = twin_patch_handler
+
+        pipeline = init_audio_pipeline()
+        ring_buffer = np.zeros(pipeline["samples_native"], dtype=np.float32)
+        hop = pipeline["hop_native"]
+
+        with sd.InputStream(samplerate=pipeline["native_sr"], channels=1, dtype="float32", blocksize=hop) as stream:
+            while True:
+                await handle_ui_command()
+
+                chunk, _ = await asyncio.to_thread(stream.read, hop)
+                ring_buffer = np.roll(ring_buffer, -hop)
+                ring_buffer[-hop:] = chunk[:, 0]
+
+                rms = float(np.sqrt(np.mean(ring_buffer ** 2)))
+                detected = []
+                latency_ms = 0.0
+
+                if is_listening and rms >= volume_gate:
+                    t0 = time.perf_counter()
+                    features = extract_features(ring_buffer, pipeline)
+                    probs = predict_notes(features, pipeline)
+                    latency_ms = (time.perf_counter() - t0) * 1000.0
+
+                    detected, midis = format_active_notes(probs)
+                    if is_recording and midis:
+                        accumulate_session_notes(midis)
+
+                publish_live_state(pipeline["mic_info"], rms, latency_ms, detected)
+    finally:
+        await disconnect()
 
 if __name__ == "__main__":
     try:
