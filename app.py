@@ -1,14 +1,20 @@
 import json
 import os
+import uuid
 import streamlit as st
 import config
 
 
 def send_command(payload):
-    tmp_path = config.COMMAND_FILE.with_suffix(".tmp")
-    with open(tmp_path, "w", encoding="utf-8") as f:
-        json.dump(payload, f)
-    os.replace(tmp_path, config.COMMAND_FILE)
+    tmp_path = config.COMMAND_FILE.with_name(
+        f"{config.COMMAND_FILE.name}.{uuid.uuid4().hex}.tmp"
+    )
+    try:
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            json.dump(payload, f)
+        os.replace(tmp_path, config.COMMAND_FILE)
+    finally:
+        tmp_path.unlink(missing_ok=True)
 
 
 def read_live_state():
