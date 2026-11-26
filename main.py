@@ -190,6 +190,80 @@ def format_active_notes(probs):
     return detected, valid_midis
 
 
+# --- SESSION RECORDING & CLOUD PAYLOAD ---
+
+def start_recording():
+    global is_recording, note_counts, first_pc, last_pc
+    is_recording = True
+    note_counts = np.zeros(12, dtype=int)
+    first_pc = None
+    last_pc = None
+
+def accumulate_session_notes(midi_numbers):
+    global first_pc, last_pc
+    for midi_num in midi_numbers:
+        pc = midi_num % 12
+        note_counts[pc] += 1
+        if first_pc is None:
+            first_pc = pc
+        last_pc = pc
+
+def format_notes_summary():
+    return ", ".join(
+        f"{NOTE_NAMES[i]}:{int(note_counts[i])}"
+        for i in range(12)
+        if note_counts[i] > 0
+    )
+
+def build_session_payload():
+    total = int(np.sum(note_counts))
+    pcts = np.round(note_counts / float(total), 4)
+    payload = {
+        "session_id": str(uuid.uuid4())[:8],
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "device_id": config.DEVICE_ID,
+        "total_notes": total,
+    }
+    for i, name in enumerate(NOTE_NAMES):
+        payload[f"pct_{name}"] = float(pcts[i])
+    payload["first_pc"] = first_pc
+    payload["last_pc"] = last_pc
+    return payload
+
+def preview_cloud_key_mock(payload):
+    """Temporary local preview until Azure Function + AutoML endpoint is deployed."""
+    scores = [
+        ("8A - A Minor", round(min(0.95, 0.35 + (payload["pct_A"] + payload["pct_C"] + payload["pct_E"]) * 0.7), 2)),
+        ("8B - C Major", round(min(0.95, 0.32 + (payload["pct_C"] + payload["pct_E"] + payload["pct_G"]) * 0.7), 2)),
+        ("9B - G Major", round(min(0.95, 0.20 + (payload["pct_G"] + payload["pct_B"] + payload["pct_D"]) * 0.6), 2)),
+    ]
+    scores.sort(key=lambda item: item[1], reverse=True)
+    return [{"key": k, "confidence": c} for k, c in scores]
+
+async def stop_recording():
+    global is_recording, last_result
+    if not is_recording:
+        return
+
+    is_recording = False
+    if int(np.sum(note_counts)) == 0:
+        return
+
+    notes_played = format_notes_summary()
+    payload = build_session_payload()
+
+    await asyncio.to_thread(save_to_questdb, payload, notes_played)
+    await send_session_to_iothub(payload)
+
+    last_result = {
+        "session_id": payload["session_id"],
+        "total_notes": payload["total_notes"],
+        "notes_played": notes_played,
+        "synced": client is not None,
+        "mock_cloud_predictions": preview_cloud_key_mock(payload),
+    }
+
+
 # ----------- MAIN ------------
 
 async def main():
