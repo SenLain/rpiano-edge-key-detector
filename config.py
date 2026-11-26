@@ -19,6 +19,6 @@ COMMAND_FILE = RUNTIME_DIR / "command.json"
 # Cloud & Local Storage Credentials (loaded from .env)
 IOT_CONNECTION_STRING = os.getenv("IOT_CONNECTION_STRING")
 DEVICE_ID = os.getenv("DEVICE_ID")
-QUESTDB_URL = os.getenv("QUESTDB_URL")
+QUESTDB_CONF = os.getenv("QUESTDB_CONF")
 
 STANDARD_PIANO_SIZES = [25, 49, 61, 76, 88]
