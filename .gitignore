@@ -3,3 +3,10 @@ runtime/
 venv/
 __pycache__/
 *.pyc
+
+bin/
+obj/
+.vs/
+*.user
+
+local.settings.json
