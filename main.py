@@ -272,7 +272,14 @@ def write_json_atomic(path, data):
     try:
         with open(tmp_path, "w", encoding="utf-8") as f:
             json.dump(data, f)
-        os.replace(tmp_path, path)
+        for attempt in range(10):
+            try:
+                os.replace(tmp_path, path)
+                break
+            except PermissionError:
+                if attempt == 9:
+                    raise
+                time.sleep(0.03)
     finally:
         tmp_path.unlink(missing_ok=True)
 
